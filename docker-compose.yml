@@ -1,0 +1,12 @@
+services:
+  api:
+    build: ./app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - sample-site
+
+  sample-site:
+    build: ./sample_site
+    ports:
+      - "8080:80"
