@@ -10,8 +10,11 @@
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
+from decimal import Decimal, localcontext
+from typing import Any
 from urllib.parse import urldefrag, urljoin, urlsplit
 
 import httpx
@@ -27,21 +30,22 @@ STATUS_WITHIN = "未超限"
 STATUS_UNDETERMINABLE = "无法判定"
 
 # 形如 "0.004 mg/L"、"<0.05 mg/L"、"<5 μg/L"、"≤1 微克/升"
+# 数值允许科学计数法（如 "1e-5 mg/L"）；全程用 Decimal 解析，避免二进制浮点丢精度。
 _RESULT_RE = re.compile(
     r"""^\s*
     (?P<flag><|≤|＜|<=|＜=)?\s*
-    (?P<num>\d+(?:\.\d+)?)
+    (?P<num>(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)
     \s*(?P<unit>mg/l|μg/l|µg/l|ug/l|毫克/升|微克/升)
     \s*$""",
     re.IGNORECASE | re.VERBOSE,
 )
 
 _UNIT_FACTORS = {
-    "mg/l": 1.0,
-    "毫克/升": 1.0,
-    "μg/l": 0.001,
-    "ug/l": 0.001,
-    "微克/升": 0.001,
+    "mg/l": Decimal("1"),
+    "毫克/升": Decimal("1"),
+    "μg/l": Decimal("0.001"),
+    "ug/l": Decimal("0.001"),
+    "微克/升": Decimal("0.001"),
 }
 
 # 字段中文标签（按优先级排列，包含匹配）
@@ -59,34 +63,162 @@ class DetailParseError(Exception):
     """详情页结构不符合预期（缺少必填字段）。"""
 
 
+class Numeric(float):
+    """精确十进制数值在 JSON 响应中的载体。
+
+    继承 ``float``，因此在 FastAPI/pydantic 的编码器与 ``json.dumps`` 中都被当作
+    JSON number（而不是字符串）；同时保留原始 ``Decimal`` 作为数值真值。比较、
+    格式化均走 Decimal，绝不经过二进制浮点，故 0.0100000001 与 0.01 可严格区分。
+    响应序列化时由 API 层优先读取 ``decimal``，从而输出完整的十进制位。
+    """
+
+    __slots__ = ("_decimal",)
+
+    def __new__(cls, value: Decimal | str | int | float | "Numeric") -> "Numeric":
+        if isinstance(value, Numeric):
+            dec = value._decimal
+        elif isinstance(value, Decimal):
+            dec = value
+        else:
+            dec = Decimal(str(value))
+        obj = float.__new__(cls, float(dec))
+        obj._decimal = dec
+        return obj
+
+    @property
+    def decimal(self) -> Decimal:
+        return self._decimal
+
+    @staticmethod
+    def _other_dec(other: object) -> object:
+        """把参与比较的另一操作数转换为 Decimal，非数值原样返回。"""
+        if isinstance(other, Numeric):
+            return other._decimal
+        if isinstance(other, Decimal):
+            return other
+        if isinstance(other, float):
+            return None if math.isnan(other) or math.isinf(other) else Decimal(str(other))
+        if isinstance(other, int) and not isinstance(other, bool):
+            return Decimal(other)
+        return None
+
+    def __repr__(self) -> str:
+        return format(self._decimal, "f")
+
+    __str__ = __repr__
+
+    def __eq__(self, other: object) -> bool:
+        dec = self._other_dec(other)
+        if dec is None:
+            return False if isinstance(other, (float, int, Decimal)) else NotImplemented
+        return self._decimal == dec
+
+    def __ne__(self, other: object) -> bool:
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    def __hash__(self) -> int:
+        return hash(self._decimal)
+
+    def __lt__(self, other: object) -> bool:
+        return self._decimal < _exact(other)
+
+    def __le__(self, other: object) -> bool:
+        return self._decimal <= _exact(other)
+
+    def __gt__(self, other: object) -> bool:
+        return self._decimal > _exact(other)
+
+    def __ge__(self, other: object) -> bool:
+        return self._decimal >= _exact(other)
+
+
+def _exact(value: Any) -> Decimal:
+    """把限值等输入转换为 Decimal，避免二进制浮点丢精度。"""
+    if isinstance(value, Numeric):
+        return value.decimal
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"限值必须是有限数值: {value!r}")
+    return Decimal(str(value))
+
+
+def _exact_scale(value: Decimal, factor: Decimal) -> Decimal:
+    """精确乘以 10 的整数次幂因子，不受默认 Decimal 精度（28 位）截断。"""
+    digits = max(len(value.as_tuple().digits), 1)
+    places = max(-factor.as_tuple().exponent, 0)
+    with localcontext() as ctx:
+        ctx.prec = digits + places + 10
+        return value * factor
+
+
+def _decimal_number(value: Decimal) -> Numeric:
+    """把精确 Decimal 包装成响应用的 JSON number。"""
+    return Numeric(value)
+
+
+def _plain_text(value: Decimal) -> str:
+    """Decimal 的完整十进制文本；不用科学计数法，不丢任何有效位。
+
+    极端量级（展开后极长）改用科学计数法，避免生成超长响应；JSON 数字允许
+    指数形式，数值精度不受影响。
+    """
+    if value.is_zero():
+        return "0"
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int):
+        digits = len(value.as_tuple().digits)
+        plain_length = digits + max(-exponent, 0) + 2  # 小数点 + 可能的符号
+        if plain_length > 128:
+            return str(value.normalize())
+    return format(value, "f")
+
+
+def json_number_text(value: Decimal | Numeric) -> str:
+    """把精确十进制数值渲染成 JSON number 文本（不含引号）。"""
+    dec = value.decimal if isinstance(value, Numeric) else value
+    return _plain_text(dec)
+
+
 @dataclass
 class ArsenicReading:
-    kind: str      # "value" | "below_detection_limit"
-    mg_l: float    # 换算为 mg/L 后的数值（数值结果或检出限）
+    kind: str            # "value" | "below_detection_limit"
+    mg_l: Numeric        # 换算为 mg/L 后的精确数值（数值结果或检出限）
     raw: str
+
+    def __post_init__(self) -> None:
+        # 兼容直接以 float/Decimal 构造的调用方：统一保留精确十进制真值。
+        if not isinstance(self.mg_l, Numeric):
+            self.mg_l = Numeric(_exact(self.mg_l))
 
 
 def parse_arsenic(text: str | None) -> ArsenicReading | None:
-    """解析砷结果文本，返回 None 表示无法解析。"""
+    """解析砷结果文本，返回 None 表示无法解析。全程使用 Decimal 精确换算。"""
     m = _RESULT_RE.match(text or "")
     if not m:
         return None
     unit = m.group("unit").lower().replace("µ", "μ")
-    # round 避免 9.8 * 0.001 = 0.009800000000000001 之类的浮点噪声
-    value = round(float(m.group("num")) * _UNIT_FACTORS[unit], 9)
+    value = _exact_scale(Decimal(m.group("num")), _UNIT_FACTORS[unit])
     kind = "below_detection_limit" if m.group("flag") else "value"
     return ArsenicReading(kind=kind, mg_l=value, raw=(text or "").strip())
 
 
-def classify(reading: ArsenicReading, limit_mg_l: float) -> str:
-    """按限值判定单样本状态。
+def classify(reading: ArsenicReading, limit_mg_l: Decimal | float | str | Numeric) -> str:
+    """按限值判定单样本状态（Decimal 全程比较，无浮点误差）。"""
+    return classify_decimals(reading, _exact(limit_mg_l))
+
+
+def classify_decimals(reading: ArsenicReading, limit: Decimal) -> str:
+    """同 classify，但限值已转换为 Decimal，避免重复转换。
 
     - 数值结果：> 限值 → 超限；≤ 限值（含等于）→ 未超限。
     - "<检出限"：检出限 > 限值 → 无法判定；检出限 ≤ 限值 → 未超限。
     """
+    observed = _exact(reading.mg_l)
     if reading.kind == "value":
-        return STATUS_EXCEEDS if reading.mg_l > limit_mg_l else STATUS_WITHIN
-    if reading.mg_l > limit_mg_l:
+        return STATUS_EXCEEDS if observed > limit else STATUS_WITHIN
+    if observed > limit:
         return STATUS_UNDETERMINABLE
     return STATUS_WITHIN
 
@@ -167,8 +299,22 @@ def _parse_detail(html: str, url: str) -> dict:
     return record
 
 
-def collect(list_url: str, sampling_point: str, limit_mg_l: float) -> dict:
-    """从分页列表 URL 出发，采集指定取样点的砷检测记录并逐样本判定。"""
+def collect(
+    list_url: str,
+    sampling_point: str,
+    limit_mg_l: Decimal | float | str | Numeric,
+) -> dict:
+    """从分页列表 URL 出发，采集指定取样点的砷检测记录并逐样本判定。
+
+    ``limit_mg_l`` 以 Decimal 参与全部比较；响应中的 mg/L 数值以 ``Numeric``
+    返回，保留完整十进制位，足以复核判定。
+    """
+    limit = _exact(limit_mg_l)
+    if not limit.is_finite():
+        raise ValueError(f"无效的限值: {limit_mg_l!r}")
+    if limit < 0:
+        raise ValueError(f"限值不能为负数: {limit_mg_l!r}")
+
     list_url = _normalize(list_url)
     site_netloc = urlsplit(list_url).netloc.lower()
     if not site_netloc:
@@ -176,7 +322,7 @@ def collect(list_url: str, sampling_point: str, limit_mg_l: float) -> dict:
 
     result: dict = {
         "sampling_point": sampling_point,
-        "limit_mg_l": limit_mg_l,
+        "limit_mg_l": _decimal_number(limit),
         "incomplete": False,
         "failed_details": [],
         "pages_visited": [],
@@ -233,10 +379,13 @@ def collect(list_url: str, sampling_point: str, limit_mg_l: float) -> dict:
                 sample["status"] = STATUS_UNDETERMINABLE
                 sample["note"] = "砷结果格式无法解析"
             else:
-                sample["arsenic_mg_l"] = reading.mg_l
-                sample["status"] = classify(reading, limit_mg_l)
+                mg_l = reading.mg_l
+                sample["arsenic_mg_l"] = _decimal_number(mg_l)
+                sample["status"] = classify_decimals(reading, limit)
                 if reading.kind == "below_detection_limit":
-                    sample["note"] = f"结果低于检出限 {reading.mg_l:g} mg/L"
+                    sample["note"] = (
+                        f"结果低于检出限 {_plain_text(_exact(mg_l))} mg/L"
+                    )
             result["samples"].append(sample)
 
     result["incomplete"] = bool(result["failed_details"])

@@ -40,6 +40,11 @@ curl -s -X POST http://localhost:8000/check \
 - **`<检出限`**：`检出限 > 限值` → **无法判定**（真值可能高于限值）；
   `检出限 ≤ 限值` → 未超限（真值严格小于限值）。
 - 结果文本无法解析时，该样本标记为无法判定并附 `note` 说明。
+- **十进制精度**：限值、详情数值与单位换算全程按十进制精确计算，不经过二进制浮点，
+  因此 `0.0100000001 mg/L`、`10.0000001 μg/L` 在限值 0.01 mg/L 时严格判为**超限**，
+  `<0.0100000001 mg/L` 判为**无法判定**；限值自身也可带更多小数（如 `0.0100000001`），
+  此时与限值相等的结果仍按未超限处理。响应中的 `limit_mg_l` / `arsenic_mg_l` 保持
+  数值类型（JSON number），并保留完整的十进制位供复核。
 
 ## 采集行为约定
 
@@ -60,22 +65,26 @@ curl -s -X POST http://localhost:8000/check \
   "incomplete": true,
   "failed_details": [{"url": "http://sample-site/detail/d999.html", "error": "..."}],
   "pages_visited": ["http://sample-site/list/page1.html", "..."],
-  "details_found": 10,
+  "details_found": 14,
   "duplicates_skipped": 1,
   "samples": [
     {
-      "sample_id": "AS-2026-1102",
+      "sample_id": "AS-2026-1111",
       "sampling_point": "SP-01",
-      "sampled_at": "2026-11-03 09:25",
-      "arsenic_raw": "12 μg/L",
-      "arsenic_mg_l": 0.012,
+      "sampled_at": "2026-11-08 08:20",
+      "arsenic_raw": "0.0100000001 mg/L",
+      "arsenic_mg_l": 0.0100000001,
       "status": "超限",
       "note": null,
-      "source_url": "http://sample-site/detail/d002.html"
+      "source_url": "http://sample-site/detail/d010.html"
     }
   ]
 }
 ```
+
+`limit_mg_l` 与 `arsenic_mg_l` 均为 JSON 数值（number，不是字符串），并保留完整的
+十进制位，可直接用响应中的数值复核判定。
+
 
 ## 样例站点数据（限值 0.01 mg/L 时的预期判定）
 
@@ -90,6 +99,10 @@ curl -s -X POST http://localhost:8000/check \
 | AS-2026-1107 | SP-01 | 9.8 μg/L | 未超限 |
 | AS-2026-1108 | SP-01 | 10.1 μg/L | 超限 |
 | AS-2026-1109 | SP-01 | <0.01 mg/L | 未超限（检出限等于限值） |
+| AS-2026-1111 | SP-01 | 0.0100000001 mg/L | 超限（严格高于限值 0.01） |
+| AS-2026-1112 | SP-01 | 10.0000001 μg/L | 超限（换算后严格高于限值 0.01） |
+| AS-2026-1113 | SP-01 | <0.0100000001 mg/L | 无法判定（检出限高于限值） |
+| AS-2026-1114 | SP-01 | <10.0000001 μg/L | 无法判定（检出限高于限值） |
 | AS-2026-1110 | SP-01 | 链接已失效 | 计入 failed_details，incomplete=true |
 
 ## 本地开发（不用 Docker）
